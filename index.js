@@ -7,25 +7,30 @@ const {
 const { Boom } = require("@hapi/boom");
 const { handlePesan } = require("./pesan");
 const fs = require("fs");
+const qrcode = require("qrcode-terminal"); // ← penting!
 
 async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState("session");
 
   const sock = makeWASocket({
     auth: state,
-    printQRInTerminal: true, // ✅ Tampilkan QR di terminal
     getMessage: async () => ({})
   });
 
-  sock.ev.on("connection.update", ({ connection, lastDisconnect }) => {
+  // ✅ Ganti printQRInTerminal → tampilkan QR manual
+  sock.ev.on("connection.update", async ({ connection, qr, lastDisconnect }) => {
+    if (qr) {
+      qrcode.generate(qr, { small: true }); // ✅ Tampilkan QR manual
+    }
+
     if (connection === "open") {
-      console.log("✅ Bot WhatsApp aktif setelah scan QR!");
+      console.log("✅ Bot aktif! Kamu sudah login.");
     } else if (connection === "close") {
       const reason = new Boom(lastDisconnect?.error)?.output?.statusCode;
       if (reason === DisconnectReason.loggedOut) {
-        console.log("❌ Terlogout. Scan ulang QR.");
+        console.log("❌ Terlogout. Jalankan ulang untuk scan ulang.");
       } else {
-        console.log("🔄 Terputus. Reconnecting...");
+        console.log("🔄 Koneksi putus. Mencoba ulang...");
         startBot();
       }
     }
@@ -38,9 +43,9 @@ async function startBot() {
     const sender = msg.key.remoteJid;
     const text = msg.message.conversation || msg.message.extendedTextMessage?.text;
 
-    const balasan = handlePesan(sender, text);
-    if (balasan) {
-      await sock.sendMessage(sender, { text: balasan });
+    const reply = handlePesan(sender, text);
+    if (reply) {
+      await sock.sendMessage(sender, { text: reply });
     }
   });
 
