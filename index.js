@@ -1,9 +1,10 @@
 const { Client, LocalAuth } = require('whatsapp-web.js');
-const qrcode = require('qrcode-terminal');
 const low = require('lowdb');
 const FileSync = require('lowdb/adapters/FileSync');
 
-// Setup database
+// ================================================
+// DATABASE SETUP
+// ================================================
 const adapter = new FileSync('spam-db.json');
 const db = low(adapter);
 db.defaults({ 
@@ -17,31 +18,49 @@ db.defaults({
     }
 }).write();
 
+// ================================================
+// CLIENT SETUP (PAIRING MODE)
+// ================================================
 const client = new Client({
     authStrategy: new LocalAuth(),
-    puppeteer: { headless: true }
+    puppeteer: { 
+        headless: true,
+        args: ['--no-sandbox']
+    },
+    authOptions: {
+        qrTimeout: 0, // Nonaktifkan QR
+        phonePairingCode: true // Aktifkan pairing code
+    }
 });
 
-// Variabel untuk melacak aktivitas pengguna
+// Track user activity
 const userActivity = new Map();
 
-client.on('qr', (qr) => {
-    qrcode.generate(qr, { small: true });
+// ================================================
+// PAIRING CODE HANDLER
+// ================================================
+client.on('pairing_code', (code) => {
+    console.log(`\nPAIRING CODE: ${code}\n`);
+    console.log('Cara Pakai:');
+    console.log('1. Buka WhatsApp di HP');
+    console.log('2. Menu 3 titik → Linked Devices → Link a Device');
+    console.log('3. Masukkan kode di atas\n');
 });
 
 client.on('ready', () => {
-    console.log('Bot siap digunakan!');
-    // Jadwal pembersihan data aktivitas setiap jam
+    console.log('[!] Bot aktif dan siap digunakan!');
+    // Bersihkan aktivitas setiap jam
     setInterval(() => {
         userActivity.clear();
-        console.log('Aktivitas pengguna dibersihkan');
+        console.log('[!] Aktivitas pengguna dibersihkan');
     }, 3600000);
 });
 
+// ================================================
+// ANTI-SPAM CORE FUNCTION
+// ================================================
 client.on('message', async msg => {
-    if (msg.from.endsWith('@g.us')) {
-        await handleAntiSpam(msg);
-    }
+    if (msg.from.endsWith('@g.us')) await handleAntiSpam(msg);
 });
 
 async function handleAntiSpam(msg) {
@@ -49,9 +68,87 @@ async function handleAntiSpam(msg) {
     const sender = await msg.getContact();
     const userId = sender.id.user;
     const groupId = chat.id._serialized;
-    const message = msg.body;
-    
-    // Inisialisasi data grup jika belum ada
+
+    // Skip jika admin
+    if (await checkIsAdmin(msg) && db.get(`groupSettings.${groupId}.adminBypass`).value()) {
+        return;
+    }
+
+    // Inisialisasi data pengguna/grup
+    initUserData(userId);
+    initGroupData(groupId);
+
+    // Deteksi spam
+    const spamDetected = await detectSpam(msg, userId, groupId, msg.body);
+    if (spamDetected) {
+        await handleSpammer(msg, userId, groupId, spamDetected.type);
+    }
+}
+
+// ================================================
+// IMPROVED DETECT SPAM FUNCTION (FIXED)
+// ================================================
+async function detectSpam(msg, userId, groupId, message) {
+    const userData = db.get(`users.${userId}`).value();
+    const groupSettings = db.get(`groupSettings.${groupId}`).value();
+    const { flood, caps, repeat, links } = db.get('spamPatterns').value();
+
+    // 1. Deteksi Flood
+    const activities = userActivity.get(userId) || [];
+    if (activities.length >= flood.threshold) {
+        const timeDiff = Date.now() - activities[0].timestamp;
+        if (timeDiff < flood.interval) return { type: 'flood', severity: 'high' };
+    }
+
+    // 2. Deteksi CAPS
+    if (message.length > 10) {
+        const capsRatio = (message.match(/[A-Z]/g) || []).length / message.length;
+        if (capsRatio > caps.threshold) return { type: 'caps', severity: 'medium' };
+    }
+
+    // 3. Deteksi Repeat
+    if (userData.lastMessages.length >= repeat.threshold) {
+        const lastMessages = userData.lastMessages.slice(-repeat.threshold);
+        if (lastMessages.every(m => m === message)) return { type: 'repeat', severity: 'medium' };
+    }
+
+    // 4. Deteksi Links (strict mode only)
+    if (groupSettings.strictMode) {
+        const detectedLinks = message.match(/https?:\/\/[^\s]+/g) || [];
+        if (detectedLinks.some(link => {
+            const domain = new URL(link).hostname.replace('www.', '');
+            return !links.whitelist.includes(domain);
+        })) return { type: 'links', severity: 'high' };
+    }
+
+    // 5. Deteksi Pattern Spam (FIXED: ganti nama variabel)
+    const SPAM_PATTERNS = [
+        /([!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?]{4,})/,
+        /(\w{20,})/,
+        /([\u200B-\u200D\uFEFF])/
+    ];
+
+    if (SPAM_PATTERNS.some(pattern => pattern.test(message))) {
+        return { type: 'pattern', severity: 'high' };
+    }
+
+    return null;
+}
+
+// ================================================
+// HELPER FUNCTIONS
+// ================================================
+function initUserData(userId) {
+    if (!db.get(`users.${userId}`).value()) {
+        db.set(`users.${userId}`, {
+            warnings: 0,
+            lastMessages: [],
+            isMuted: false
+        }).write();
+    }
+}
+
+function initGroupData(groupId) {
     if (!db.get(`groupSettings.${groupId}`).value()) {
         db.set(`groupSettings.${groupId}`, {
             antiSpamEnabled: true,
@@ -59,185 +156,59 @@ async function handleAntiSpam(msg) {
             adminBypass: true
         }).write();
     }
-    
-    // Skip jika pengirim adalah admin dan adminBypass aktif
-    const isAdmin = await checkIsAdmin(msg);
-    if (isAdmin && db.get(`groupSettings.${groupId}.adminBypass`).value()) {
-        return;
-    }
-    
-    // Inisialisasi data pengguna jika belum ada
-    if (!db.get(`users.${userId}`).value()) {
-        db.set(`users.${userId}`, {
-            warnings: 0,
-            lastMessages: [],
-            lastLinks: [],
-            isMuted: false
-        }).write();
-    }
-    
-    // Update aktivitas pengguna
-    updateUserActivity(userId, groupId, message);
-    
-    // Deteksi berbagai jenis spam
-    const spamDetected = await detectSpam(msg, userId, groupId, message);
-    
-    if (spamDetected) {
-        await handleSpammer(msg, userId, groupId, spamDetected.type);
-    }
-}
-
-async function detectSpam(msg, userId, groupId, message) {
-    const userData = db.get(`users.${userId}`).value();
-    const groupSettings = db.get(`groupSettings.${groupId}`).value();
-    const spamPatterns = db.get('spamPatterns').value();
-    
-    // 1. Deteksi Flood (terlalu banyak pesan dalam waktu singkat)
-    const userMessages = userActivity.get(userId) || [];
-    if (userMessages.length >= spamPatterns.flood.threshold) {
-        const firstMessageTime = userMessages[0].timestamp;
-        const timeDiff = Date.now() - firstMessageTime;
-        
-        if (timeDiff < spamPatterns.flood.interval) {
-            return { type: 'flood', severity: 'high' };
-        }
-    }
-    
-    // 2. Deteksi CAPS LOCK (terlalu banyak huruf kapital)
-    if (message.length > 10) {
-        const capsCount = (message.match(/[A-Z]/g) || []).length;
-        const capsRatio = capsCount / message.length;
-        
-        if (capsRatio > spamPatterns.caps.threshold) {
-            return { type: 'caps', severity: 'medium' };
-        }
-    }
-    
-    // 3. Deteksi pesan berulang
-    if (userData.lastMessages.length >= spamPatterns.repeat.threshold) {
-        const lastMessages = userData.lastMessages.slice(-spamPatterns.repeat.threshold);
-        const allSame = lastMessages.every(m => m === message);
-        
-        if (allSame) {
-            return { type: 'repeat', severity: 'medium' };
-        }
-    }
-    
-    // 4. Deteksi link (jika strict mode aktif)
-    if (groupSettings.strictMode) {
-        const linkRegex = /https?:\/\/[^\s]+/g;
-        const links = message.match(linkRegex) || [];
-        
-        if (links.length > 0) {
-            const whitelist = spamPatterns.links.whitelist;
-            const hasNonWhitelisted = links.some(link => {
-                const domain = new URL(link).hostname.replace('www.', '');
-                return !whitelist.includes(domain);
-            });
-            
-            if (hasNonWhitelisted) {
-                return { type: 'links', severity: 'high' };
-            }
-        }
-    }
-    
-    // 5. Deteksi karakter khusus/spam pattern
-    const spamPatterns = [
-        /([!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?]{4,})/, // Banyak karakter khusus
-        /(\w{20,})/, // Kata sangat panjang
-        /([\u200B-\u200D\uFEFF])/ // Karakter tak terlihat
-    ];
-    
-    for (const pattern of spamPatterns) {
-        if (pattern.test(message)) {
-            return { type: 'pattern', severity: 'high' };
-        }
-    }
-    
-    return null;
 }
 
 async function handleSpammer(msg, userId, groupId, spamType) {
     const chat = await msg.getChat();
     const sender = await msg.getContact();
-    const userName = sender.pushname || sender.id.user;
-    const groupSettings = db.get(`groupSettings.${groupId}`).value();
-    
-    // Update peringatan pengguna
+    const warnings = db.get(`users.${userId}.warnings`).value() + 1;
+
+    // Update peringatan
     db.update(`users.${userId}.warnings`, w => w + 1).write();
-    db.update(`users.${userId}.lastMessages`, messages => [...messages, msg.body].slice(-10)).write();
-    
-    const warnings = db.get(`users.${userId}.warnings`).value();
-    
-    // Pesan peringatan berdasarkan jenis spam
-    const warningMessages = {
-        flood: `@${userId} Mohon jangan mengirim pesan terlalu cepat! (Peringatan ${warnings}/3)`,
-        caps: `@${userId} Mohon hindari penggunaan huruf kapital berlebihan! (Peringatan ${warnings}/3)`,
-        repeat: `@${userId} Mohon jangan mengirim pesan yang sama berulang kali! (Peringatan ${warnings}/3)`,
-        links: `@${userId} Berbagi link tidak diizinkan di grup ini! (Peringatan ${warnings}/3)`,
-        pattern: `@${userId} Pesan Anda terdeteksi sebagai spam! (Peringatan ${warnings}/3)`
-    };
-    
-    await msg.reply(warningMessages[spamType] || `@${userId} Aktivitas Anda terdeteksi sebagai spam! (Peringatan ${warnings}/3)`);
-    
-    // Aksi berdasarkan jumlah peringatan
+    db.update(`users.${userId}.lastMessages`, messages => [...messages, msg.body].slice(-5)).write();
+
+    // Kirim peringatan
+    const warningMsg = `@${userId} ${getWarningMessage(spamType)} (Peringatan ${warnings}/3)`;
+    await msg.reply(warningMsg);
+
+    // Tindakan jika 3x peringatan
     if (warnings >= 3) {
+        const groupSettings = db.get(`groupSettings.${groupId}`).value();
         try {
             if (groupSettings.strictMode) {
                 await chat.removeParticipants([sender.id._serialized]);
-                await msg.reply(`@${userId} telah dikick karena spam.`);
+                await msg.reply(`@${userId} dikeluarkan karena spam.`);
             } else {
-                // Mute pengguna (dengan mengubah izin grup)
                 await chat.setMessagesAdminsOnly(true);
-                await msg.reply(`@${userId} telah dimute karena spam.`);
-                db.set(`users.${userId}.isMuted`, true).write();
-                
-                // Unmute setelah 1 jam
-                setTimeout(async () => {
-                    await chat.setMessagesAdminsOnly(false);
-                    db.set(`users.${userId}.isMuted`, false).write();
-                    db.set(`users.${userId}.warnings`, 0).write();
-                }, 3600000);
+                await msg.reply(`@${userId} dimute selama 1 jam.`);
+                setTimeout(() => chat.setMessagesAdminsOnly(false), 3600000);
             }
-            
-            // Reset peringatan
             db.set(`users.${userId}.warnings`, 0).write();
         } catch (error) {
-            console.error('Gagal mengambil tindakan anti-spam:', error);
+            console.error('Gagal mengambil tindakan:', error);
         }
     }
 }
 
-function updateUserActivity(userId, groupId, message) {
-    const now = Date.now();
-    const userData = { timestamp: now, groupId, message };
-    
-    if (!userActivity.has(userId)) {
-        userActivity.set(userId, [userData]);
-    } else {
-        const activities = userActivity.get(userId);
-        activities.push(userData);
-        
-        // Simpan hanya 10 aktivitas terakhir
-        if (activities.length > 10) {
-            userActivity.set(userId, activities.slice(-10));
-        }
-    }
-    
-    // Update database
-    db.update(`users.${userId}.lastMessages`, messages => [...(messages || []), message].slice(-5)).write();
+function getWarningMessage(type) {
+    const messages = {
+        flood: 'Jangan kirim pesan terlalu cepat!',
+        caps: 'Hindari huruf kapital berlebihan!',
+        repeat: 'Jangan kirim pesan berulang!',
+        links: 'Berbagi link dilarang!',
+        pattern: 'Pesan terdeteksi sebagai spam!'
+    };
+    return messages[type] || 'Aktivitas terdeteksi sebagai spam!';
 }
 
 async function checkIsAdmin(msg) {
     const chat = await msg.getChat();
     const contact = await msg.getContact();
     const participants = await chat.participants;
-    
-    const user = participants.find(
-        participant => participant.id._serialized === contact.id._serialized
-    );
-    
-    return user && user.isAdmin;
+    return participants.some(p => p.id._serialized === contact.id._serialized && p.isAdmin);
 }
 
+// ================================================
+// START BOT
+// ================================================
 client.initialize();
