@@ -10,7 +10,7 @@ const config = {
     name: "Group Guardian Bot",
     prefix: "!",
     pairingCode: "123456", // Ganti dengan kode pairing
-    adminNumbers: ["6281234567890"], // Nomor admin
+    adminNumbers: ["62895335107865"], // Nomor admin
     bannedWords: ["kata1", "kata2", "kata3"], // Kata terlarang
     welcomeMessage: "Selamat datang di grup!",
     goodbyeMessage: "Selamat tinggal!",
