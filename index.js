@@ -24,7 +24,7 @@ async function startBot() {
       console.log("✅ Bot WhatsApp aktif via Pairing Code!");
       if (!state.creds?.registered) {
         try {
-          const kode = await sock.requestPairingCode("6285647271487"); // ← ganti dengan nomor kamu
+          const kode = await sock.requestPairingCode("62895335107865"); // ← ganti dengan nomor kamu
           console.log("🔐 Pairing Code (masukkan di HP):", kode);
         } catch (err) {
           console.error("❌ Gagal mendapatkan pairing code:", err);
