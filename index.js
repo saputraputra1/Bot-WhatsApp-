@@ -1,4 +1,11 @@
-const { WAConnection, MessageType, Mimetype, Presence } = require('@adiwajshing/baileys');
+const { 
+    makeWASocket, 
+    useSingleFileAuthState,
+    fetchLatestBaileysVersion,
+    Browsers,
+    proto,
+    getContentType 
+} = require('@whiskeysockets/baileys');
 const fs = require('fs');
 const axios = require('axios');
 const FormData = require('form-data');
@@ -6,7 +13,12 @@ const ffmpeg = require('fluent-ffmpeg');
 const { exec } = require('child_process');
 
 // Koneksi WhatsApp
-const conn = new WAConnection();
+const { state, saveState } = useSingleFileAuthState('./auth_info.json');
+const sock = makeWASocket({
+    auth: state,
+    printQRInTerminal: false,
+    browser: Browsers.macOS('Chrome')
+});
 
 // Config
 const config = {
