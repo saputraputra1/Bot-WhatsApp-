@@ -1,0 +1,6 @@
+{
+  "use_pairing_code": true,
+  "pairing_code": "123456",
+  "browser": "Pterodactyl",
+  "qr_timeout": 60
+}
