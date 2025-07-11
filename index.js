@@ -1,19 +1,11 @@
 const {
   default: makeWASocket,
-  useMultiFileAuthState,
-  fetchLatestBaileysVersion,
-  useSingleFileAuthState,
-  makeCacheableSignalKeyStore,
-  PHONENUMBER_MCC,
-  makeWALegacySocket,
-  useRemoteFileAuthState,
-  makeInMemoryStore,
-  makeWAPairingCode
+  useMultiFileAuthState
 } = require("@whiskeysockets/baileys");
 
-const { handlePesan } = require("./pesan");
 const { Boom } = require("@hapi/boom");
 const fs = require("fs");
+const { handlePesan } = require("./pesan");
 
 async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState("session");
@@ -21,16 +13,25 @@ async function startBot() {
   const sock = makeWASocket({
     auth: state,
     printQRInTerminal: false,
-    getMessage: async () => ({}),
+    getMessage: async () => ({})
   });
 
-  // Pairing code langsung dari soket
-  if (!state.creds?.registered) {
-    const code = await sock.requestPairingCode("6285647271487"); // Ganti nomor kamu di sini
-    console.log("🔐 Pairing Code:", code);
-  }
+  let sudahTampilkanKode = false;
 
   sock.ev.on("creds.update", saveCreds);
+
+  sock.ev.on("connection.update", async ({ connection }) => {
+    if (connection === "open") {
+      console.log("✅ Bot aktif via pairing code!");
+      if (!state.creds?.registered && !sudahTampilkanKode) {
+        const kode = await sock.requestPairingCode("6285647271487"); // ← Ganti nomormu di sini
+        console.log("🔐 Pairing Code:", kode);
+        sudahTampilkanKode = true;
+      }
+    } else if (connection === "close") {
+      console.log("❌ Koneksi terputus. Jalankan ulang jika perlu pairing ulang.");
+    }
+  });
 
   sock.ev.on("messages.upsert", async ({ messages }) => {
     const msg = messages[0];
@@ -42,12 +43,6 @@ async function startBot() {
     const reply = handlePesan(sender, text);
     if (reply) {
       await sock.sendMessage(sender, { text: reply });
-    }
-  });
-
-  sock.ev.on("connection.update", ({ connection }) => {
-    if (connection === "open") {
-      console.log("✅ Bot aktif via pairing code!");
     }
   });
 }
