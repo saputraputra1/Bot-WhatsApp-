@@ -1,214 +1,393 @@
-const { Client, LocalAuth } = require('whatsapp-web.js');
-const low = require('lowdb');
-const FileSync = require('lowdb/adapters/FileSync');
+const { WAConnection, MessageType, Mimetype, Presence } = require('@adiwajshing/baileys');
+const fs = require('fs');
+const axios = require('axios');
+const FormData = require('form-data');
+const ffmpeg = require('fluent-ffmpeg');
+const { exec } = require('child_process');
 
-// ================================================
-// DATABASE SETUP
-// ================================================
-const adapter = new FileSync('spam-db.json');
-const db = low(adapter);
-db.defaults({ 
-    users: {}, 
-    groupSettings: {},
-    spamPatterns: {
-        flood: { threshold: 5, interval: 10000 }, // 5 pesan dalam 10 detik
-        caps: { threshold: 0.7 }, // 70% huruf kapital
-        repeat: { threshold: 3 }, // 3 pesan berulang
-        links: { whitelist: [] } // domain yang diizinkan
-    }
-}).write();
+// Koneksi WhatsApp
+const conn = new WAConnection();
 
-// ================================================
-// CLIENT SETUP (PAIRING MODE)
-// ================================================
-const client = new Client({
-    authStrategy: new LocalAuth(),
-    puppeteer: { 
-        headless: true,
-        args: ['--no-sandbox']
-    },
-    authOptions: {
-        qrTimeout: 0, // Nonaktifkan QR
-        phonePairingCode: true // Aktifkan pairing code
-    }
-});
+// Config
+const config = {
+    name: "Group Guardian Bot",
+    prefix: "!",
+    pairingCode: "123456", // Ganti dengan kode pairing yang Anda inginkan
+    adminNumbers: ["62895335107865"], // Nomor admin
+    bannedWords: ["kata1", "kata2", "kata3"], // Kata-kata terlarang
+    welcomeMessage: "Selamat datang di grup!",
+    goodbyeMessage: "Selamat tinggal!"
+};
 
-// Track user activity
-const userActivity = new Map();
+// Database sederhana
+const groupSettings = {};
+const userWarnings = {};
 
-// ================================================
-// PAIRING CODE HANDLER
-// ================================================
-client.on('pairing_code', (code) => {
-    console.log(`\nPAIRING CODE: ${code}\n`);
-    console.log('Cara Pakai:');
-    console.log('1. Buka WhatsApp di HP');
-    console.log('2. Menu 3 titik → Linked Devices → Link a Device');
-    console.log('3. Masukkan kode di atas\n');
-});
-
-client.on('ready', () => {
-    console.log('[!] Bot aktif dan siap digunakan!');
-    // Bersihkan aktivitas setiap jam
-    setInterval(() => {
-        userActivity.clear();
-        console.log('[!] Aktivitas pengguna dibersihkan');
-    }, 3600000);
-});
-
-// ================================================
-// ANTI-SPAM CORE FUNCTION
-// ================================================
-client.on('message', async msg => {
-    if (msg.from.endsWith('@g.us')) await handleAntiSpam(msg);
-});
-
-async function handleAntiSpam(msg) {
-    const chat = await msg.getChat();
-    const sender = await msg.getContact();
-    const userId = sender.id.user;
-    const groupId = chat.id._serialized;
-
-    // Skip jika admin
-    if (await checkIsAdmin(msg) && db.get(`groupSettings.${groupId}.adminBypass`).value()) {
-        return;
-    }
-
-    // Inisialisasi data pengguna/grup
-    initUserData(userId);
-    initGroupData(groupId);
-
-    // Deteksi spam
-    const spamDetected = await detectSpam(msg, userId, groupId, msg.body);
-    if (spamDetected) {
-        await handleSpammer(msg, userId, groupId, spamDetected.type);
-    }
+// Fungsi untuk menampilkan animasi loading
+function showLoadingAnimation(text) {
+    const frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    let i = 0;
+    return setInterval(() => {
+        process.stdout.write(`\r${frames[i = ++i % frames.length]} ${text}`);
+    }, 80);
 }
 
-// ================================================
-// IMPROVED DETECT SPAM FUNCTION (FIXED)
-// ================================================
-async function detectSpam(msg, userId, groupId, message) {
-    const userData = db.get(`users.${userId}`).value();
-    const groupSettings = db.get(`groupSettings.${groupId}`).value();
-    const { flood, caps, repeat, links } = db.get('spamPatterns').value();
+// Pairing tanpa QR
+conn.on('credentials-updated', () => {
+    const authInfo = conn.base64EncodedAuthInfo();
+    fs.writeFileSync('./auth_info.json', JSON.stringify(authInfo, null, 2));
+});
 
-    // 1. Deteksi Flood
-    const activities = userActivity.get(userId) || [];
-    if (activities.length >= flood.threshold) {
-        const timeDiff = Date.now() - activities[0].timestamp;
-        if (timeDiff < flood.interval) return { type: 'flood', severity: 'high' };
-    }
-
-    // 2. Deteksi CAPS
-    if (message.length > 10) {
-        const capsRatio = (message.match(/[A-Z]/g) || []).length / message.length;
-        if (capsRatio > caps.threshold) return { type: 'caps', severity: 'medium' };
-    }
-
-    // 3. Deteksi Repeat
-    if (userData.lastMessages.length >= repeat.threshold) {
-        const lastMessages = userData.lastMessages.slice(-repeat.threshold);
-        if (lastMessages.every(m => m === message)) return { type: 'repeat', severity: 'medium' };
-    }
-
-    // 4. Deteksi Links (strict mode only)
-    if (groupSettings.strictMode) {
-        const detectedLinks = message.match(/https?:\/\/[^\s]+/g) || [];
-        if (detectedLinks.some(link => {
-            const domain = new URL(link).hostname.replace('www.', '');
-            return !links.whitelist.includes(domain);
-        })) return { type: 'links', severity: 'high' };
-    }
-
-    // 5. Deteksi Pattern Spam (FIXED: ganti nama variabel)
-    const SPAM_PATTERNS = [
-        /([!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?]{4,})/,
-        /(\w{20,})/,
-        /([\u200B-\u200D\uFEFF])/
-    ];
-
-    if (SPAM_PATTERNS.some(pattern => pattern.test(message))) {
-        return { type: 'pattern', severity: 'high' };
-    }
-
-    return null;
+if (fs.existsSync('./auth_info.json')) {
+    conn.loadAuthInfo('./auth_info.json');
 }
 
-// ================================================
-// HELPER FUNCTIONS
-// ================================================
-function initUserData(userId) {
-    if (!db.get(`users.${userId}`).value()) {
-        db.set(`users.${userId}`, {
-            warnings: 0,
-            lastMessages: [],
-            isMuted: false
-        }).write();
+// Event saat terhubung
+conn.on('open', () => {
+    const loading = showLoadingAnimation('Bot sedang memulai...');
+    
+    setTimeout(() => {
+        clearInterval(loading);
+        console.log('\nBot berhasil terhubung!');
+        console.log(`Gunakan kode pairing: ${config.pairingCode}`);
+    }, 3000);
+});
+
+// Event saat menerima pesan
+conn.on('chat-update', async chatUpdate => {
+    if (!chatUpdate.hasNewMessage) return;
+    
+    const m = chatUpdate.messages.all()[0];
+    if (!m.message) return;
+    
+    const messageType = Object.keys(m.message)[0];
+    const text = m.message.conversation || 
+                (m.message.extendedTextMessage && m.message.extendedTextMessage.text) || '';
+    const sender = m.key.remoteJid;
+    const isGroup = sender.endsWith('@g.us');
+    const groupId = isGroup ? sender : null;
+    const user = m.participant ? m.participant : sender;
+    
+    // Inisialisasi pengaturan grup jika belum ada
+    if (isGroup && !groupSettings[groupId]) {
+        groupSettings[groupId] = {
+            autoKick: true,
+            autoAdd: false,
+            warnBeforeKick: true
+        };
     }
-}
-
-function initGroupData(groupId) {
-    if (!db.get(`groupSettings.${groupId}`).value()) {
-        db.set(`groupSettings.${groupId}`, {
-            antiSpamEnabled: true,
-            strictMode: false,
-            adminBypass: true
-        }).write();
-    }
-}
-
-async function handleSpammer(msg, userId, groupId, spamType) {
-    const chat = await msg.getChat();
-    const sender = await msg.getContact();
-    const warnings = db.get(`users.${userId}.warnings`).value() + 1;
-
-    // Update peringatan
-    db.update(`users.${userId}.warnings`, w => w + 1).write();
-    db.update(`users.${userId}.lastMessages`, messages => [...messages, msg.body].slice(-5)).write();
-
-    // Kirim peringatan
-    const warningMsg = `@${userId} ${getWarningMessage(spamType)} (Peringatan ${warnings}/3)`;
-    await msg.reply(warningMsg);
-
-    // Tindakan jika 3x peringatan
-    if (warnings >= 3) {
-        const groupSettings = db.get(`groupSettings.${groupId}`).value();
-        try {
-            if (groupSettings.strictMode) {
-                await chat.removeParticipants([sender.id._serialized]);
-                await msg.reply(`@${userId} dikeluarkan karena spam.`);
-            } else {
-                await chat.setMessagesAdminsOnly(true);
-                await msg.reply(`@${userId} dimute selama 1 jam.`);
-                setTimeout(() => chat.setMessagesAdminsOnly(false), 3600000);
+    
+    // Cek kata terlarang
+    if (isGroup && groupSettings[groupId].autoKick) {
+        const bannedWord = config.bannedWords.find(word => 
+            text.toLowerCase().includes(word.toLowerCase())
+        );
+        
+        if (bannedWord) {
+            if (groupSettings[groupId].warnBeforeKick) {
+                // Beri peringatan dulu
+                if (!userWarnings[user]) userWarnings[user] = 0;
+                userWarnings[user]++;
+                
+                if (userWarnings[user] < 2) {
+                    await conn.sendMessage(groupId, `⚠ Peringatan @${user.split('@')[0]}! Jangan menggunakan kata terlarang "${bannedWord}"`, MessageType.text, {
+                        contextInfo: { mentionedJid: [user] }
+                    });
+                    return;
+                }
             }
-            db.set(`users.${userId}.warnings`, 0).write();
-        } catch (error) {
-            console.error('Gagal mengambil tindakan:', error);
+            
+            // Kick member
+            try {
+                await conn.groupRemove(groupId, [user]);
+                await conn.sendMessage(groupId, `🚫 @${user.split('@')[0]} telah dikick karena menggunakan kata terlarang "${bannedWord}"`, MessageType.text, {
+                    contextInfo: { mentionedJid: [user] }
+                });
+                
+                // Reset peringatan
+                if (userWarnings[user]) delete userWarnings[user];
+            } catch (error) {
+                console.error('Gagal mengkick member:', error);
+            }
         }
     }
-}
+    
+    // Proses command
+    if (text.startsWith(config.prefix)) {
+        const command = text.split(' ')[0].slice(config.prefix.length).toLowerCase();
+        const args = text.split(' ').slice(1);
+        
+        // Command untuk admin
+        if (config.adminNumbers.includes(user.split('@')[0])) {
+            switch(command) {
+                case 'add':
+                    if (isGroup && args.length > 0) {
+                        const numbers = args.map(num => num.includes('@') ? num : num + '@s.whatsapp.net');
+                        await conn.groupAdd(groupId, numbers);
+                        await conn.sendMessage(groupId, `✅ Berhasil menambahkan ${numbers.length} member`, MessageType.text);
+                    }
+                    break;
+                    
+                case 'kick':
+                    if (isGroup && args.length > 0) {
+                        const numbers = args.map(num => num.includes('@') ? num : num + '@s.whatsapp.net');
+                        await conn.groupRemove(groupId, numbers);
+                        await conn.sendMessage(groupId, `🚫 Berhasil mengkick ${numbers.length} member`, MessageType.text);
+                    }
+                    break;
+                    
+                case 'autokick':
+                    if (isGroup) {
+                        groupSettings[groupId].autoKick = !groupSettings[groupId].autoKick;
+                        const status = groupSettings[groupId].autoKick ? 'AKTIF' : 'NONAKTIF';
+                        await conn.sendMessage(groupId, `🔧 Auto Kick: ${status}`, MessageType.text);
+                    }
+                    break;
+                    
+                case 'autoadd':
+                    if (isGroup) {
+                        groupSettings[groupId].autoAdd = !groupSettings[groupId].autoAdd;
+                        const status = groupSettings[groupId].autoAdd ? 'AKTIF' : 'NONAKTIF';
+                        await conn.sendMessage(groupId, `🔧 Auto Add: ${status}`, MessageType.text);
+                    }
+                    break;
+                    
+                case 'warnmode':
+                    if (isGroup) {
+                        groupSettings[groupId].warnBeforeKick = !groupSettings[groupId].warnBeforeKick;
+                        const status = groupSettings[groupId].warnBeforeKick ? 'AKTIF' : 'NONAKTIF';
+                        await conn.sendMessage(groupId, `🔧 Peringatan sebelum kick: ${status}`, MessageType.text);
+                    }
+                    break;
+                    
+                case 'banword':
+                    if (args.length > 0) {
+                        const word = args[0].toLowerCase();
+                        if (!config.bannedWords.includes(word)) {
+                            config.bannedWords.push(word);
+                            await conn.sendMessage(sender, `✅ Kata "${word}" ditambahkan ke daftar terlarang`, MessageType.text);
+                        } else {
+                            await conn.sendMessage(sender, `⚠ Kata "${word}" sudah ada dalam daftar terlarang`, MessageType.text);
+                        }
+                    }
+                    break;
+            }
+        }
+        
+        // Command untuk semua user
+        switch(command) {
+            case 'menu':
+                const menu = `
+🤖 *${config.name}* 🤖
 
-function getWarningMessage(type) {
-    const messages = {
-        flood: 'Jangan kirim pesan terlalu cepat!',
-        caps: 'Hindari huruf kapital berlebihan!',
-        repeat: 'Jangan kirim pesan berulang!',
-        links: 'Berbagi link dilarang!',
-        pattern: 'Pesan terdeteksi sebagai spam!'
-    };
-    return messages[type] || 'Aktivitas terdeteksi sebagai spam!';
-}
+📌 *Admin Commands:*
+!add [nomor] - Tambahkan member
+!kick [nomor] - Kick member
+!autokick - Aktifkan/nonaktifkan auto kick
+!autoadd - Aktifkan/nonaktifkan auto add
+!warnmode - Aktifkan/nonaktifkan peringatan sebelum kick
+!banword [kata] - Tambahkan kata terlarang
 
-async function checkIsAdmin(msg) {
-    const chat = await msg.getChat();
-    const contact = await msg.getContact();
-    const participants = await chat.participants;
-    return participants.some(p => p.id._serialized === contact.id._serialized && p.isAdmin);
-}
+📥 *Download Commands:*
+!yt [url] - Download video YouTube
+!ig [url] - Download video Instagram
+!tt [url] - Download video TikTok
+!song [judul] - Download lagu
 
-// ================================================
-// START BOT
-// ================================================
-client.initialize();
+🖼 *Media Commands:*
+!sticker - Buat stiker dari gambar
+!toimg - Ubah stiker menjadi gambar
+!resize [lebar] [tinggi] - Ubah ukuran gambar
+
+Ketik !help [command] untuk info lebih detail
+                `;
+                await conn.sendMessage(sender, menu, MessageType.text);
+                break;
+                
+            case 'yt':
+                if (args.length > 0) {
+                    const loading = showLoadingAnimation('Mengunduh video YouTube...');
+                    try {
+                        const url = args[0];
+                        const { data } = await axios.get(`https://ytdl-api.herokuapp.com/?url=${url}`);
+                        
+                        clearInterval(loading);
+                        console.log('\nVideo berhasil diunduh!');
+                        
+                        await conn.sendMessage(sender, '📥 Video YouTube berhasil diunduh!', MessageType.text);
+                        await conn.sendMessage(sender, data.videoUrl, MessageType.video, {
+                            mimetype: Mimetype.mp4,
+                            caption: 'Video YouTube'
+                        });
+                    } catch (error) {
+                        clearInterval(loading);
+                        console.error('\nGagal mengunduh video:', error);
+                        await conn.sendMessage(sender, '❌ Gagal mengunduh video YouTube', MessageType.text);
+                    }
+                }
+                break;
+                
+            case 'ig':
+                if (args.length > 0) {
+                    const loading = showLoadingAnimation('Mengunduh video Instagram...');
+                    try {
+                        const url = args[0];
+                        const { data } = await axios.get(`https://instagram-downloader-api.herokuapp.com/?url=${url}`);
+                        
+                        clearInterval(loading);
+                        console.log('\nVideo berhasil diunduh!');
+                        
+                        await conn.sendMessage(sender, '📥 Video Instagram berhasil diunduh!', MessageType.text);
+                        await conn.sendMessage(sender, data.videoUrl, MessageType.video, {
+                            mimetype: Mimetype.mp4,
+                            caption: 'Video Instagram'
+                        });
+                    } catch (error) {
+                        clearInterval(loading);
+                        console.error('\nGagal mengunduh video:', error);
+                        await conn.sendMessage(sender, '❌ Gagal mengunduh video Instagram', MessageType.text);
+                    }
+                }
+                break;
+                
+            case 'tt':
+                if (args.length > 0) {
+                    const loading = showLoadingAnimation('Mengunduh video TikTok...');
+                    try {
+                        const url = args[0];
+                        const { data } = await axios.get(`https://tiktok-downloader-api.herokuapp.com/?url=${url}`);
+                        
+                        clearInterval(loading);
+                        console.log('\nVideo berhasil diunduh!');
+                        
+                        await conn.sendMessage(sender, '📥 Video TikTok berhasil diunduh!', MessageType.text);
+                        await conn.sendMessage(sender, data.videoUrl, MessageType.video, {
+                            mimetype: Mimetype.mp4,
+                            caption: 'Video TikTok'
+                        });
+                    } catch (error) {
+                        clearInterval(loading);
+                        console.error('\nGagal mengunduh video:', error);
+                        await conn.sendMessage(sender, '❌ Gagal mengunduh video TikTok', MessageType.text);
+                    }
+                }
+                break;
+                
+            case 'song':
+                if (args.length > 0) {
+                    const loading = showLoadingAnimation('Mencari dan mengunduh lagu...');
+                    try {
+                        const query = args.join(' ');
+                        const { data } = await axios.get(`https://song-downloader-api.herokuapp.com/?query=${encodeURIComponent(query)}`);
+                        
+                        clearInterval(loading);
+                        console.log('\nLagu berhasil diunduh!');
+                        
+                        await conn.sendMessage(sender, '🎵 Lagu berhasil diunduh!', MessageType.text);
+                        await conn.sendMessage(sender, data.audioUrl, MessageType.audio, {
+                            mimetype: Mimetype.mp4Audio,
+                            ptt: false
+                        });
+                    } catch (error) {
+                        clearInterval(loading);
+                        console.error('\nGagal mengunduh lagu:', error);
+                        await conn.sendMessage(sender, '❌ Gagal mengunduh lagu', MessageType.text);
+                    }
+                }
+                break;
+                
+            case 'sticker':
+                if (m.message.imageMessage || (m.message.extendedTextMessage && m.message.extendedTextMessage.contextInfo && m.message.extendedTextMessage.contextInfo.quotedMessage && m.message.extendedTextMessage.contextInfo.quotedMessage.imageMessage)) {
+                    const loading = showLoadingAnimation('Membuat stiker...');
+                    try {
+                        const imageBuffer = await conn.downloadMediaMessage(m);
+                        const outputPath = './temp/sticker.webp';
+                        
+                        await new Promise((resolve, reject) => {
+                            ffmpeg()
+                                .input(imageBuffer)
+                                .outputOptions([
+                                    '-vcodec libwebp',
+                                    '-vf scale=512:512',
+                                    '-lossless 1',
+                                    '-q 80',
+                                    '-preset default',
+                                    '-loop 0',
+                                    '-an',
+                                    '-vsync 0'
+                                ])
+                                .toFormat('webp')
+                                .save(outputPath)
+                                .on('end', resolve)
+                                .on('error', reject);
+                        });
+                        
+                        clearInterval(loading);
+                        console.log('\nStiker berhasil dibuat!');
+                        
+                        await conn.sendMessage(sender, fs.readFileSync(outputPath), MessageType.sticker);
+                        fs.unlinkSync(outputPath);
+                    } catch (error) {
+                        clearInterval(loading);
+                        console.error('\nGagal membuat stiker:', error);
+                        await conn.sendMessage(sender, '❌ Gagal membuat stiker', MessageType.text);
+                    }
+                } else {
+                    await conn.sendMessage(sender, '⚠ Kirim gambar atau reply gambar dengan caption !sticker', MessageType.text);
+                }
+                break;
+                
+            case 'toimg':
+                if (m.message.stickerMessage) {
+                    const loading = showLoadingAnimation('Mengubah stiker ke gambar...');
+                    try {
+                        const stickerBuffer = await conn.downloadMediaMessage(m);
+                        const outputPath = './temp/image.png';
+                        
+                        await new Promise((resolve, reject) => {
+                            ffmpeg()
+                                .input(stickerBuffer)
+                                .toFormat('png')
+                                .save(outputPath)
+                                .on('end', resolve)
+                                .on('error', reject);
+                        });
+                        
+                        clearInterval(loading);
+                        console.log('\nGambar berhasil dibuat!');
+                        
+                        await conn.sendMessage(sender, fs.readFileSync(outputPath), MessageType.image, {
+                            mimetype: Mimetype.png
+                        });
+                        fs.unlinkSync(outputPath);
+                    } catch (error) {
+                        clearInterval(loading);
+                        console.error('\nGagal mengubah stiker:', error);
+                        await conn.sendMessage(sender, '❌ Gagal mengubah stiker ke gambar', MessageType.text);
+                    }
+                } else {
+                    await conn.sendMessage(sender, '⚠ Kirim stiker dengan caption !toimg', MessageType.text);
+                }
+                break;
+        }
+    }
+});
+
+// Event saat ada yang bergabung ke grup
+conn.on('group-participants-update', async ({jid, participants, action}) => {
+    if (action === 'add') {
+        // Kirim pesan selamat datang
+        await conn.sendMessage(jid, config.welcomeMessage, MessageType.text);
+        
+        // Jika auto add aktif, tambahkan ke database
+        if (groupSettings[jid] && groupSettings[jid].autoAdd) {
+            // Simpan data member baru
+        }
+    } else if (action === 'remove') {
+        // Kirim pesan selamat tinggal
+        await conn.sendMessage(jid, config.goodbyeMessage, MessageType.text);
+    }
+});
+
+// Mulai bot
+conn.connect();
