@@ -1,15 +1,28 @@
-const { default: makeWASocket, useSingleFileAuthState, DisconnectReason } = require("@whiskeysockets/baileys");
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+} = require("@whiskeysockets/baileys");
 const { Boom } = require("@hapi/boom");
 const { handlePesan } = require("./pesan");
-const { state, saveState } = useSingleFileAuthState("./session.json");
 
 async function startBot() {
+  const { state, saveCreds, getPairingCode } = await useMultiFileAuthState("session");
+
   const sock = makeWASocket({
     auth: state,
-    printQRInTerminal: true
+    printQRInTerminal: false,
+    getMessage: async () => ({}),
   });
 
-  sock.ev.on("creds.update", saveState);
+  // Tampilkan pairing code hanya sekali saat login pertama
+  if (!state.creds?.registered) {
+    const nomor = "628xxxxxxxxxx"; // ← Ganti dengan nomor kamu (tanpa +)
+    const code = await getPairingCode(nomor);
+    console.log(`🔐 Pairing Code untuk ${nomor}: ${code}`);
+  }
+
+  sock.ev.on("creds.update", saveCreds);
 
   sock.ev.on("messages.upsert", async ({ messages }) => {
     const msg = messages[0];
@@ -26,13 +39,15 @@ async function startBot() {
 
   sock.ev.on("connection.update", ({ connection, lastDisconnect }) => {
     if (connection === "close") {
-      if (lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut) {
-        startBot();
+      const reason = new Boom(lastDisconnect?.error)?.output?.statusCode;
+      if (reason === DisconnectReason.loggedOut) {
+        console.log("❌ Terlogout. Jalankan ulang untuk pairing ulang.");
       } else {
-        console.log("❌ Terlogout. Jalankan ulang untuk login.");
+        console.log("🔁 Koneksi terputus. Menghubungkan ulang...");
+        startBot(); // Auto reconnect
       }
     } else if (connection === "open") {
-      console.log("✅ Bot Nokos aktif!");
+      console.log("✅ Bot WhatsApp aktif via Pairing Code!");
     }
   });
 }
