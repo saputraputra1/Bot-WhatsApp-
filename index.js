@@ -1,13 +1,22 @@
 const {
   default: makeWASocket,
   useMultiFileAuthState,
-  DisconnectReason,
+  fetchLatestBaileysVersion,
+  useSingleFileAuthState,
+  makeCacheableSignalKeyStore,
+  PHONENUMBER_MCC,
+  makeWALegacySocket,
+  useRemoteFileAuthState,
+  makeInMemoryStore,
+  makeWAPairingCode
 } = require("@whiskeysockets/baileys");
-const { Boom } = require("@hapi/boom");
+
 const { handlePesan } = require("./pesan");
+const { Boom } = require("@hapi/boom");
+const fs = require("fs");
 
 async function startBot() {
-  const { state, saveCreds, getPairingCode } = await useMultiFileAuthState("session");
+  const { state, saveCreds } = await useMultiFileAuthState("session");
 
   const sock = makeWASocket({
     auth: state,
@@ -15,11 +24,10 @@ async function startBot() {
     getMessage: async () => ({}),
   });
 
-  // Tampilkan pairing code hanya sekali saat login pertama
+  // Pairing code langsung dari soket
   if (!state.creds?.registered) {
-    const nomor = "628xxxxxxxxxx"; // ← Ganti dengan nomor kamu (tanpa +)
-    const code = await getPairingCode(nomor);
-    console.log(`🔐 Pairing Code untuk ${nomor}: ${code}`);
+    const code = await sock.requestPairingCode("6285647271487"); // Ganti nomor kamu di sini
+    console.log("🔐 Pairing Code:", code);
   }
 
   sock.ev.on("creds.update", saveCreds);
@@ -31,23 +39,15 @@ async function startBot() {
     const sender = msg.key.remoteJid;
     const text = msg.message.conversation || msg.message.extendedTextMessage?.text;
 
-    const balasan = handlePesan(sender, text);
-    if (balasan) {
-      await sock.sendMessage(sender, { text: balasan });
+    const reply = handlePesan(sender, text);
+    if (reply) {
+      await sock.sendMessage(sender, { text: reply });
     }
   });
 
-  sock.ev.on("connection.update", ({ connection, lastDisconnect }) => {
-    if (connection === "close") {
-      const reason = new Boom(lastDisconnect?.error)?.output?.statusCode;
-      if (reason === DisconnectReason.loggedOut) {
-        console.log("❌ Terlogout. Jalankan ulang untuk pairing ulang.");
-      } else {
-        console.log("🔁 Koneksi terputus. Menghubungkan ulang...");
-        startBot(); // Auto reconnect
-      }
-    } else if (connection === "open") {
-      console.log("✅ Bot WhatsApp aktif via Pairing Code!");
+  sock.ev.on("connection.update", ({ connection }) => {
+    if (connection === "open") {
+      console.log("✅ Bot aktif via pairing code!");
     }
   });
 }
